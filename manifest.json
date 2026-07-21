@@ -1,0 +1,47 @@
+{
+  "manifest_version": "0.3",
+  "name": "waypoint",
+  "version": "0.1.0",
+  "description": "Search, read, create, and comment on Jira Cloud tickets from Claude.",
+  "author": {
+    "name": "sagarpatil-appt"
+  },
+  "compatibility": {
+    "platforms": ["darwin"]
+  },
+  "server": {
+    "type": "python",
+    "entry_point": "waypoint_server.py",
+    "mcp_config": {
+      "command": "python3",
+      "args": ["${__dirname}/waypoint_server.py"],
+      "env": {
+        "PYTHONPATH": "${__dirname}/lib",
+        "JIRA_SITE_URL": "${user_config.site_url}",
+        "JIRA_EMAIL": "${user_config.email}",
+        "JIRA_API_TOKEN": "${user_config.api_token}"
+      }
+    }
+  },
+  "user_config": {
+    "site_url": {
+      "type": "string",
+      "title": "Jira site URL",
+      "description": "Your Jira Cloud site, e.g. https://yourcompany.atlassian.net",
+      "required": true
+    },
+    "email": {
+      "type": "string",
+      "title": "Atlassian account email",
+      "description": "The email you sign in to Jira with",
+      "required": true
+    },
+    "api_token": {
+      "type": "string",
+      "title": "Jira API token",
+      "description": "Create one at https://id.atlassian.com/manage-profile/security/api-tokens",
+      "required": true,
+      "sensitive": true
+    }
+  }
+}

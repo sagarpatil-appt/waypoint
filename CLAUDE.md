@@ -1,0 +1,181 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+**Waypoint** — an MCP (Model Context Protocol) server, built with `mcp[cli]`'s `FastMCP`, that
+exposes Jira ticket operations as tools over stdio. The entire server lives in
+`waypoint_server.py` — there is no package structure beyond that single file. The name is
+deliberately platform-neutral: today it only talks to Jira Cloud, but the intent is for the
+ticket-to-code loop to grow to other trackers/platforms (e.g. GitHub Issues/PRs) later without
+another rebrand — don't bake the name "Jira" into anything beyond the tool/variable names that
+are genuinely Jira-specific today.
+
+## Running the server
+
+Dependencies are managed via `pyproject.toml`/`uv.lock`; install with `uv sync` (this venv has no
+`pip` — it's `uv`-managed). `pyproject.toml` defines a `waypoint` console-script entry point
+(`[project.scripts]`, calling `waypoint_server:main`) backed by an explicit `[build-system]` (setuptools)
+— without that table, `uv sync`/`uv build` silently skip building the package and no entry point
+gets installed.
+
+```bash
+uv sync                    # installs deps + the waypoint console script into .venv/bin
+.venv/bin/waypoint  # or: python waypoint_server.py — both run the stdio server directly
+```
+
+It runs over the `stdio` transport, so it's meant to be launched by an MCP client (e.g. Claude
+Desktop/Code config via `.mcp.json` or `claude mcp add`), not invoked standalone for interactive
+use. Use `mcp dev waypoint_server.py` (from the `mcp[cli]` package) to inspect/test tools interactively
+via the MCP Inspector. `uvx --from <path-or-git-url> waypoint` runs it with no prior clone/
+install at all — see `README.md` for the full one-command install story, plus the alternate MCPB
+(Claude Desktop one-click extension) packaging path via `manifest.json`.
+
+## Configuration
+
+Connection state (`site_url`, `email`, `api_token`) lives in the in-memory `_config` dict
+(`waypoint_server.py`), seeded at import from a `.env` file (gitignored) if one exists:
+
+- `JIRA_SITE_URL` — e.g. `https://yourcompany.atlassian.net`
+- `JIRA_EMAIL` — Atlassian account email used for basic auth
+- `JIRA_API_TOKEN` — Atlassian API token
+- `JIRA_PROJECT_REPOS` — JSON-encoded `{project_key: {"repo_path": ..., "subdirectory": ...}}`,
+  populated via the `set_project_workspace` tool (see Architecture) rather than hand-edited.
+
+The server does **not** fail to start if `.env` is missing/incomplete — it starts unconfigured and
+every tool that calls `_client()` raises a clear `ValueError` pointing the caller at
+`setup_jira_connection` until credentials are set. This is the intended "first-run" UX for a new
+user connecting through an MCP client: no manual file editing required. `setup_jira_connection`
+validates the given site URL/email/API token against Jira's `/myself` endpoint before accepting
+them, then persists them via `_save_env()`, which rewrites only the `JIRA_*` lines in `.env`
+(preserving anything else there) and chmods it `0600` — this now includes `JIRA_PROJECT_REPOS`
+alongside the three connection fields, so `_save_env()`'s managed-keys tuple must stay in sync if
+another persisted field is ever added. `jira_connection_status` reports whether a connection is
+currently configured without exposing the token.
+
+Note: auth is basic-auth (email + API token) only — there's no OAuth 2.0 (3LO) support, which some
+enterprise Atlassian orgs with SSO enforcement may require instead. That's a known, deliberately
+unaddressed gap — adding it would mean a local OAuth callback server, client id/secret
+registration, and refresh-token handling, a meaningfully different auth architecture from the
+rest of this server, not a small addition.
+
+The `FastMCP(...)` constructor's `instructions=` string (`waypoint_server.py`) is what teaches *any*
+connecting MCP client's model — not just this repo's CLAUDE.md, which end users of a published
+server won't have — to call `jira_connection_status` first and walk an unconfigured user through
+`setup_jira_connection`. If the setup flow changes, update that string too, not just the tool
+docstrings. `README.md` documents the same flow for human readers.
+
+## Architecture
+
+- Talks to the Jira Cloud REST API v3 (`{site_url}/rest/api/3`) via `httpx.AsyncClient`, created
+  fresh per-call in `_client()` with basic auth (email + API token), after checking
+  `_is_configured()`.
+- Jira v3 stores ticket descriptions/comments as **Atlassian Document Format (ADF)**, not plain
+  strings. Two helpers bridge this:
+  - `_adf_from_text()` wraps outgoing plain text into a minimal ADF doc (single paragraph).
+  - `_text_from_adf()` flattens incoming ADF back to plain text, joining top-level blocks
+    (paragraphs, headings, list items) with newlines since ADF has no inherent inter-block
+    whitespace. It special-cases node types with no `"text"` field of their own — `mention`
+    (renders as `@name`), `emoji`, `hardBreak`, `media`/`mediaSingle`/`mediaGroup` (renders as
+    `[attachment]`), `inlineCard`/`blockCard` (renders the linked URL) — and falls back to
+    `[nodeType]` for anything else unhandled, rather than silently dropping the content. This
+    matters in practice: a comment that's purely @mentions (no plain text) used to flatten to
+    blank/whitespace, hiding real content.
+- `_raise_for_status()` is the single error path: any Jira API response >= 400 raises `ValueError`
+  with the status code and truncated response body. Tools don't otherwise catch/wrap errors.
+- Tools are registered with `@mcp.tool(...)` and use `pydantic.Field` for parameter descriptions,
+  which FastMCP surfaces to MCP clients as the tool's input schema.
+- Current tools: `setup_jira_connection` (validates + persists credentials, see Configuration
+  above), `jira_connection_status` (read-only connection check), `check_for_updates` (compares
+  the installed version — read via `importlib.metadata.version("waypoint")`, so it always
+  matches whatever's actually installed rather than a hardcoded string — against
+  `WAYPOINT_GITHUB_REPO`'s latest GitHub release; degrades gracefully with `update_available:
+  None` if that env var isn't set yet, i.e. pre-publish. Since this is a local stdio process,
+  not a background service, this is the only "notify devs of updates" mechanism available —
+  it's checked on demand, not pushed), `search_tickets` (raw JQL search)
+  and `my_open_tickets` (canned JQL:
+  `assignee = currentUser() AND statusCategory != Done`, so callers don't need to write JQL for the
+  common "what's on my plate" case) — both go through the shared `_issue_summary()` helper and
+  return `{"total": ..., "returned": ..., "issues": [...]}` rather than a bare list, so a capped
+  result set (more Jira matches than `max_results`) is visible instead of silently looking
+  complete; each issue has `summary`, `status`, `issue_type`, `assignee`/`assignee_account_id`,
+  `reporter`/`reporter_account_id`, `priority`, `created`, `updated` (keep `_issue_summary()` as the
+  single source of truth for this shape — don't let the two tools drift apart), `get_ticket`
+  (fetches `fields=*all` for attachments/reporter/priority/timestamps, plus all
+  comments via the dedicated paginated `/issue/{key}/comment` endpoint through `_fetch_all_comments()`
+  — the comment array embedded in `fields=*all` is capped at Jira's default page size, so relying on
+  it alone would silently drop comments on a busy ticket; each comment includes flattened `body`
+  text, the raw `body_adf` JSON, and `author_account_id`), `create_ticket`, `create_subtask`
+  (looks up the parent's project automatically), `add_comment`, `get_available_transitions`
+  (lists valid status transitions for a ticket — status names are workflow-specific per project,
+  e.g. one project used 'Started' instead of the more common 'In Progress', so check this rather
+  than guessing), `update_ticket_status` (resolves a
+  status name to a transition id via `/transitions` first — Jira requires the transition id, not
+  the status name, to actually change status), `update_ticket_assignee`/`add_watcher` (resolve an
+  email, display name, *or* accountId via the shared `_resolve_account_id()` helper — it tries the
+  input as a literal accountId first via `GET /user`, which works regardless of site privacy
+  settings, before falling back to `/user/search`; that fallback returns nothing on sites with
+  GDPR/privacy-mode user search restricted, common on enterprise Jira, so callers who already have
+  an accountId — e.g. from `list_watchers`'s or `get_ticket`'s `*_account_id` fields — can bypass
+  search entirely), `add_worklog` (time_spent is optional: if omitted, it requires an active
+  `set_working_issue` timer for that ticket and auto-computes elapsed wall-clock time via
+  `_fetch_time_tracking_config()` — reading the site's actual `workingHoursPerDay`/
+  `workingDaysPerWeek` from `/configuration`, defaulting to 8/5 — and `_format_duration_jira()`;
+  this is calendar elapsed time, not verified focus time, so the tool description explicitly warns
+  callers to sanity-check it before trusting it for anything that spans a break), `list_projects`
+  (project discovery — pick a valid key before `create_ticket`), `set_project_workspace`/
+  `get_project_workspace` (persists a Jira project key → `{repo_path, subdirectory}` mapping in
+  `_project_repos`/`JIRA_PROJECT_REPOS`, so `implement_ticket`'s workspace check can be
+  deterministic after the first confirmation instead of re-guessing from the git remote every
+  time), `add_attachment` (multipart upload via a one-off `httpx.AsyncClient`, not `_client()` —
+  its default `Content-Type: application/json` header would break the multipart body),
+  `list_watchers` (returns `display_name`+`account_id` per watcher), `list_link_types`/
+  `link_tickets` (creates an `/issueLink` between two tickets; call `list_link_types` first since
+  valid names are site-specific), `list_favorite_filters`, and `set_working_issue`/
+  `get_working_issue` (in-memory `_working_issue` dict — `{"key": ..., "started_at": ...}`,
+  session-scoped only, resets on server restart, no persistence by design; `started_at` backs
+  `add_worklog`'s auto-elapsed-time feature above).
+  Every tool that returns a ticket key also returns a `url` (`{site_url}/browse/{key}`).
+  `create_ticket` accepts optional `priority`/`labels`/`components` (no fix-version support yet).
+  `create_subtask` looks up the parent project's actual subtask issue-type name via
+  `/project/{key}` (falling back to `"Subtask"`) rather than assuming that name — some Jira sites
+  use `"Sub-task"` instead.
+- Two MCP **prompts** are defined separately from tools via `@mcp.prompt(...)` — each returns a
+  scripted instruction message (not a tool call) directing the calling model through a multi-step
+  workflow using the tools above. Prompts and tools are distinct MCP primitives; don't conflate the
+  two when adding new capabilities.
+  - `tour`: a no-argument onboarding walkthrough for a new user — checks connection status,
+    calls `check_for_updates` in passing, explains the server's scope, shows real data from
+    `my_open_tickets`, and explains `implement_ticket`/`plan_ticket`. Meant to be the first
+    thing a new user runs.
+  - `plan_ticket`: read a ticket, assess scope, and create sub-tasks under it.
+  - `implement_ticket`: the primary intended workflow for this server — read a ticket end to end,
+    verify the workspace (`get_project_workspace` first for a deterministic match, falling back to
+    checking `git remote -v`/directory name and asking the user to confirm if it can't tell, then
+    saving the mapping via `set_project_workspace` for next time), and either post a comment
+    flagging what's unclear (stopping short of writing code), or actually implement it: mark it as
+    the working issue, transition its status, analyze the existing code before drafting a plan,
+    write the code in the relevant project using normal file/code tools (not a Jira tool —
+    implementation happens outside this server entirely), verify it (tests/build/lint) and stop
+    without committing if verification still fails after a reasonable fix attempt, comment a
+    summary back and log time via `add_worklog` (auto-computed elapsed time by default), bias the
+    next status toward a review-style status rather than done/closed, then — after checking the
+    repo's existing branch-naming convention — ask the user whether to commit directly or on a new
+    branch, stage only the files this task touched (never a blanket add), commit as
+    `{ISSUE-KEY}: <summary>` via normal git tools, ask again before pushing (a separate
+    confirmation even if the user already chose "commit directly", since push is harder to reverse
+    and affects shared state), and offer to open a PR/MR if a new branch was pushed.
+
+  **Design intent:** this server is scoped for a single developer working one ticket at a time
+  inside their editor (fetch → analyze → flag gap or implement → status/worklog as a side effect of
+  work already happening), not for broad Jira/PM administration. Official and community Jira MCP
+  servers already cover Agile boards/sprints/epics far more completely than this one ever aims to;
+  don't add that surface area here — it would be scope creep away from what this server is for.
+
+## Adding a new tool
+
+Follow the existing pattern: decorate an `async def` with `@mcp.tool(name=..., description=...)`,
+type parameters with `pydantic.Field` for descriptions/defaults, use `_client()` for the HTTP call,
+call `await _raise_for_status(response)` before parsing, and return a plain dict/list (not the raw
+Jira JSON) shaped to what a model actually needs.

@@ -1,0 +1,9 @@
+.env
+__pycache__
+.venv
+.DS_Store
+build/
+*.egg-info/
+.mcp.json
+.claude/settings.local.json
+.vscode/
