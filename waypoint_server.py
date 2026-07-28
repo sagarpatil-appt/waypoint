@@ -502,9 +502,42 @@ async def get_ticket(
     }
 
 
+async def _fetch_project_issue_types(client: httpx.AsyncClient, project_key: str) -> list:
+    response = await client.get(f"/project/{project_key}")
+    await _raise_for_status(response)
+    return response.json().get("issueTypes", [])
+
+
+@mcp.tool(
+    name="list_issue_types",
+    description=(
+        "List every issue type available in a Jira project — including whether each one is a "
+        "sub-task type. Check this before create_ticket or create_subtask whenever the exact "
+        "type name isn't already known: projects are configured differently (some have "
+        "multiple sub-task types like 'Dev' vs 'Story Bug', or non-obvious main-type names), "
+        "so guessing risks picking the wrong one instead of asking which one applies."
+    ),
+)
+async def list_issue_types(
+    project_key: str = Field(description="Jira project key, e.g. 'ABC'"),
+):
+    async with _client() as client:
+        issue_types = await _fetch_project_issue_types(client, project_key)
+
+    return [
+        {"name": t["name"], "id": t["id"], "subtask": bool(t.get("subtask"))}
+        for t in issue_types
+    ]
+
+
 @mcp.tool(
     name="create_ticket",
-    description="Create a new Jira ticket in a project.",
+    description=(
+        "Create a new Jira ticket in a project. issue_type defaults to 'Task', but if that's "
+        "not clearly right for this project, call list_issue_types first and pass the exact "
+        "name rather than assuming — this raises a clear error listing the valid names if the "
+        "given one doesn't match, instead of leaving the choice to guesswork."
+    ),
 )
 async def create_ticket(
     project_key: str = Field(description="Project key the ticket belongs to, e.g. 'ABC'"),
@@ -515,21 +548,33 @@ async def create_ticket(
     labels: list[str] = Field(default_factory=list, description="Labels to apply to the ticket"),
     components: list[str] = Field(default_factory=list, description="Component names to apply to the ticket"),
 ):
-    fields = {
-        "project": {"key": project_key},
-        "summary": summary,
-        "description": _adf_from_text(description),
-        "issuetype": {"name": issue_type},
-    }
-    if priority:
-        fields["priority"] = {"name": priority}
-    if labels:
-        fields["labels"] = labels
-    if components:
-        fields["components"] = [{"name": c} for c in components]
-
-    payload = {"fields": fields}
     async with _client() as client:
+        issue_types = await _fetch_project_issue_types(client, project_key)
+        main_types = [t for t in issue_types if not t.get("subtask")]
+        match = next(
+            (t for t in main_types if t["name"].lower() == issue_type.strip().lower()), None
+        )
+        if not match:
+            available = ", ".join(t["name"] for t in main_types) or "none found"
+            raise ValueError(
+                f"'{issue_type}' is not a valid issue type for project {project_key}. "
+                f"Available: {available}"
+            )
+
+        fields = {
+            "project": {"key": project_key},
+            "summary": summary,
+            "description": _adf_from_text(description),
+            "issuetype": {"name": match["name"]},
+        }
+        if priority:
+            fields["priority"] = {"name": priority}
+        if labels:
+            fields["labels"] = labels
+        if components:
+            fields["components"] = [{"name": c} for c in components]
+
+        payload = {"fields": fields}
         response = await client.post("/issue", json=payload)
         await _raise_for_status(response)
         data = response.json()
@@ -539,22 +584,53 @@ async def create_ticket(
 
 @mcp.tool(
     name="create_subtask",
-    description="Create a sub-task under an existing Jira ticket.",
+    description=(
+        "Create a sub-task under an existing Jira ticket. If the project has more than one "
+        "sub-task issue type, issue_type is required — call list_issue_types first to see "
+        "the options; this tool refuses to guess between them rather than silently picking "
+        "one (e.g. 'Story Bug' instead of the intended 'Dev')."
+    ),
 )
 async def create_subtask(
     parent_key: str = Field(description="Key of the parent ticket, e.g. 'ABC-123'"),
     summary: str = Field(description="Short title of the sub-task"),
     description: str = Field(default="", description="Longer description of the sub-task"),
+    issue_type: str = Field(
+        default="",
+        description=(
+            "Sub-task issue type name, e.g. 'Dev', 'Story Bug'. Required if the project has "
+            "more than one sub-task type; call list_issue_types to see the options."
+        ),
+    ),
 ):
     async with _client() as client:
         parent = await client.get(f"/issue/{parent_key}", params={"fields": "project"})
         await _raise_for_status(parent)
         project_key = parent.json()["fields"]["project"]["key"]
 
-        project_response = await client.get(f"/project/{project_key}")
-        await _raise_for_status(project_response)
-        issue_types = project_response.json().get("issueTypes", [])
-        subtask_type = next((t["name"] for t in issue_types if t.get("subtask")), "Subtask")
+        issue_types = await _fetch_project_issue_types(client, project_key)
+        subtask_types = [t for t in issue_types if t.get("subtask")]
+
+        if issue_type.strip():
+            match = next(
+                (t for t in subtask_types if t["name"].lower() == issue_type.strip().lower()),
+                None,
+            )
+            if not match:
+                available = ", ".join(t["name"] for t in subtask_types) or "none found"
+                raise ValueError(
+                    f"'{issue_type}' is not a valid sub-task type for project {project_key}. "
+                    f"Available: {available}"
+                )
+            subtask_type_name = match["name"]
+        elif len(subtask_types) > 1:
+            available = ", ".join(t["name"] for t in subtask_types)
+            raise ValueError(
+                f"Project {project_key} has multiple sub-task types ({available}) — pass "
+                "issue_type explicitly rather than guessing which one is intended."
+            )
+        else:
+            subtask_type_name = subtask_types[0]["name"] if subtask_types else "Subtask"
 
         payload = {
             "fields": {
@@ -562,7 +638,7 @@ async def create_subtask(
                 "parent": {"key": parent_key},
                 "summary": summary,
                 "description": _adf_from_text(description),
-                "issuetype": {"name": subtask_type},
+                "issuetype": {"name": subtask_type_name},
             }
         }
         response = await client.post("/issue", json=payload)
@@ -574,7 +650,13 @@ async def create_subtask(
 
 @mcp.tool(
     name="add_comment",
-    description="Add a comment to an existing Jira ticket.",
+    description=(
+        "Add a comment to an existing Jira ticket. Write it the way a developer would type a "
+        "quick note themselves — plain, natural language, not formal or robotic phrasing. If "
+        "there's a relevant screenshot or file (shared by the user or produced while "
+        "investigating), also call add_attachment so it's actually visible on the ticket "
+        "instead of only described in text."
+    ),
 )
 async def add_comment(
     issue_key: str = Field(description="Jira issue key, e.g. 'ABC-123'"),
@@ -987,7 +1069,10 @@ def plan_ticket(
     3. If it is workable, draft a short coding plan: the concrete steps needed to
        implement it, in order.
     4. For each significant step in the plan, use the create_subtask tool to create
-       a sub-task under {issue_key} with a clear summary and description.
+       a sub-task under {issue_key} with a clear summary and description. If create_subtask
+       reports that this project has more than one sub-task type, call list_issue_types and
+       pick the right one explicitly (e.g. 'Dev' for implementation work) — don't let it
+       default to whichever type happens to come first.
     5. Summarize what you found and what sub-tasks you created.
     """
 
@@ -1026,6 +1111,8 @@ def implement_ticket(
        - If it is vague, missing key details, or contradicts what you find while
          investigating the code: use the add_comment tool to post the specific gap(s) back
          on {issue_key}, explain what you found, and STOP. Do not guess and do not write code.
+         Write it like a developer's quick note — plain language, not formal or robotic — and
+         if there's a relevant screenshot, attach it via add_attachment too, not just text.
     4. If it is workable:
        a. Use the set_working_issue tool to mark {issue_key} as the working issue for this
           session (this also starts its elapsed-time timer).
@@ -1043,7 +1130,9 @@ def implement_ticket(
             failing and why you're stopping, then report back to the user. Treat this the
             same as an unclear requirement — broken code does not get committed.
        f. Use the add_comment tool to post a concise summary of what changed and why back on
-          {issue_key}.
+          {issue_key} — write it like a developer's quick note, plain language, not formal or
+          robotic, and attach any relevant screenshot via add_attachment rather than only
+          describing it in text.
        g. Use the add_worklog tool to log time on {issue_key} — leave time_spent empty so it
           auto-computes from the real elapsed time since step 4a, unless that elapsed duration
           looks implausible (e.g. it spans a long break, meetings, or multiple days), in which

@@ -159,9 +159,10 @@ project stays scoped to the ticket-to-code loop above.
 | `search_tickets` | Search tickets with a raw JQL query (returns `total`/`returned` counts alongside `issues`, so a capped result set is visible) |
 | `my_open_tickets` | List the current user's open (not Done) tickets |
 | `get_ticket` | Read a ticket's full details, including comments and attachments |
-| `create_ticket` | Create a new ticket in a project |
-| `create_subtask` | Create a sub-task under an existing ticket |
-| `add_comment` | Add a comment to an existing ticket |
+| `list_issue_types` | List every issue type in a project, flagged sub-task or not — check this before create_ticket/create_subtask if the exact name isn't known |
+| `create_ticket` | Create a new ticket in a project — validates `issue_type` against the project's actual types rather than guessing |
+| `create_subtask` | Create a sub-task under an existing ticket — requires `issue_type` if the project has more than one sub-task type, rather than guessing |
+| `add_comment` | Add a comment to an existing ticket, in plain developer language, with any relevant screenshot attached |
 | `get_available_transitions` | List the status transitions actually available for a ticket (status names are workflow-specific — check this before guessing) |
 | `update_ticket_status` | Transition a ticket to a new status (e.g. 'In Progress', 'Done') |
 | `update_ticket_assignee` | Reassign (or unassign) a ticket — accepts an email, display name, or accountId (accountId works even on sites that restrict user search) |
