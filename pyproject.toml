@@ -5,7 +5,7 @@ description = "MCP server that routes tickets through to shipped code — Jira t
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.8.0",
+    "mcp[cli]>=1.8.0,<2.0.0",
     "httpx>=0.27.0",
     "python-dotenv>=1.1.0",
 ]
