@@ -1,7 +1,7 @@
 {
   "manifest_version": "0.3",
   "name": "waypoint",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Search, read, create, and comment on Jira Cloud tickets from Claude.",
   "author": {
     "name": "sagarpatil-appt"
