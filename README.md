@@ -26,6 +26,40 @@ your assistant anything Jira-related — since no credentials are configured yet
 for your site URL, email, and API token in the chat and save them for next time (see "First-time
 setup" below).
 
+### Updating
+
+`uvx` caches the environment it builds, so it keeps running the version you first installed
+rather than picking up new releases on its own. Ask your assistant to run `check_for_updates` to
+see whether a newer release is out. To upgrade:
+
+```bash
+uv cache clean waypoint
+```
+
+Then reconnect the server in your MCP client (`/mcp` → reconnect, or restart the session). The
+next launch rebuilds Waypoint from the latest commit on GitHub.
+
+**You'll be asked for your Jira credentials again after upgrading.** With a `uvx` install, the
+`.env` file that `setup_jira_connection` writes lives inside uv's cache alongside the installed
+package, so it's removed along with the old build. Keep your API token handy, or create a new one
+at [id.atlassian.com](https://id.atlassian.com/manage-profile/security/api-tokens). Any
+`set_project_workspace` mappings are stored in the same file and will need to be confirmed again.
+
+If the server still fails to start after upgrading — for example with
+`ModuleNotFoundError: No module named 'mcp.server.fastmcp'` from a pre-0.2.0 environment — clear
+uv's whole cache and reconnect again:
+
+```bash
+uv cache clean
+```
+
+If `claude mcp list` still shows `waypoint` pointing at an old local path instead of the `uvx`
+command, a project-scoped entry (e.g. in a `.mcp.json`) is overriding it. Remove that one:
+
+```bash
+claude mcp remove waypoint --scope project
+```
+
 ### Manual install from source
 
 If you'd rather clone and manage the venv yourself:
