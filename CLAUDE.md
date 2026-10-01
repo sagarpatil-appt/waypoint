@@ -50,7 +50,7 @@ copied to `ENV_PATH` on first run. Real environment variables (e.g. injected by 
   populated via the `set_project_workspace` tool (see Architecture) rather than hand-edited.
 
 The server does **not** fail to start if `.env` is missing/incomplete — it starts unconfigured and
-every tool that calls `_client()` raises a clear `ValueError` pointing the caller at
+every tool that calls `_client()` raises a clear `ToolError` pointing the caller at
 `setup_jira_connection` until credentials are set. This is the intended "first-run" UX for a new
 user connecting through an MCP client: no manual file editing required. `setup_jira_connection`
 validates the given site URL/email/API token against Jira's `/myself` endpoint before accepting
@@ -83,17 +83,32 @@ in all four places when editing them.
   fresh per-call in `_client()` with basic auth (email + API token), after checking
   `_is_configured()`.
 - Jira v3 stores ticket descriptions/comments as **Atlassian Document Format (ADF)**, not plain
-  strings. Two helpers bridge this:
-  - `_adf_from_text()` wraps outgoing plain text into a minimal ADF doc (single paragraph).
-  - `_text_from_adf()` flattens incoming ADF back to plain text, joining top-level blocks
-    (paragraphs, headings, list items) with newlines since ADF has no inherent inter-block
-    whitespace. It special-cases node types with no `"text"` field of their own — `mention`
-    (renders as `@name`), `emoji`, `hardBreak`, `media`/`mediaSingle`/`mediaGroup` (renders as
-    `[attachment]`), `inlineCard`/`blockCard` (renders the linked URL) — and falls back to
-    `[nodeType]` for anything else unhandled, rather than silently dropping the content. This
-    matters in practice: a comment that's purely @mentions (no plain text) used to flatten to
-    blank/whitespace, hiding real content.
-- `_raise_for_status()` is the single error path: any Jira API response >= 400 raises `ValueError`
+  strings. Models write and read Markdown best, so two converters bridge this (a deliberately
+  small, common subset of Markdown — not a full CommonMark parser):
+  - `_adf_from_markdown()` converts outgoing text (comments, descriptions, worklog notes) into
+    ADF: paragraphs with line breaks, `#` headings, bullet/numbered lists nested by indentation,
+    fenced code blocks with language, blockquotes, rules, and inline bold/italic/strike/code/
+    links/bare URLs. Previously everything went out as one plain paragraph, so code blocks and
+    lists in "what I changed" comments didn't render. The output must stay valid against
+    Atlassian's ADF JSON schema (`@atlaskit/adf-schema`, `dist/json-schema/v1/full.json`) — Jira
+    rejects invalid ADF outright — so e.g. the `code` mark is only ever combined with `link`,
+    marks are never duplicated, text nodes are never empty, and headings inside a blockquote
+    become paragraphs. `snake_case`, `__dunder__`, and `x * y` are deliberately not treated as
+    emphasis. Validate against that schema after changing it.
+  - `_text_from_adf()` renders incoming ADF back as Markdown (list markers and nesting, code
+    fences, links, tables, task lists, panels as labelled quotes, expand titles), so the model
+    sees the ticket's structure instead of a flattened blob. Nodes with no text of their own
+    still render as something readable — `mention` (`@name`), `emoji`, `status` (`[TEXT]`),
+    `date` (ISO date), `media` (`[attachment: filename]`, which pairs with
+    `download_attachment`), smart links (the URL) — and anything unrecognized becomes
+    `[nodeType]` rather than silently vanishing. A comment made only of @mentions used to
+    flatten to blank, hiding real content.
+- Errors meant for the model are raised as `ToolError` (`mcp.server.mcpserver.exceptions`), never
+  `ValueError` or other exceptions. mcp 2.x treats any other exception as a crash and replaces its
+  message with a bare "Error executing tool X" — the helpful text (valid issue types, available
+  transitions, "token expired, run setup again") never reaches the model. Only `ToolError`'s
+  message is passed through. This silently broke every error message in 0.2.0–0.2.1.
+- `_raise_for_status()` is the single error path: any Jira API response >= 400 raises `ToolError`
   with the status code and truncated response body. It also raises on an
   `X-Seraph-LoginReason: AUTHENTICATED_FAILED`/`AUTHENTICATION_DENIED` header, because a revoked or
   expired API token doesn't always 401 — endpoints that allow anonymous access (notably
@@ -120,7 +135,18 @@ in all four places when editing them.
   `/search/approximate-count` (an estimate; `None` if that call fails — never a made-up number); each issue has `summary`, `status`, `issue_type`, `assignee`/`assignee_account_id`,
   `reporter`/`reporter_account_id`, `priority`, `created`, `updated` (keep `_issue_summary()` as the
   single source of truth for this shape — don't let the two tools drift apart), `get_ticket`
-  (fetches `fields=*all` for attachments/reporter/priority/timestamps, plus all
+  (fetches `fields=*all&expand=names` and returns, besides the basics: labels, components,
+  fix/affects versions, due date, resolution, environment, `parent` and `subtasks`,
+  `linked_issues` with the relationship phrased from this ticket's side ("blocks", "is blocked
+  by" — on a GET the *other* issue appears as `outwardIssue`/`inwardIssue` with the matching
+  phrase), `remote_links` from `/issue/{key}/remotelink` (often the Confluence spec or a PR;
+  optional, so a failure there returns `[]` rather than failing the read), and `custom_fields`:
+  every non-empty `customfield_*` keyed by its display name from `names` and flattened by
+  `_field_value()` (ADF → Markdown, options/users/versions → name, sprints → "Sprint 12
+  (active)", cascading selects → "EU / Germany"; opaque objects are dropped). Acceptance
+  criteria, story points, and sprint usually live there, not in the description. `Rank`,
+  `Development`, and `[CHART]` fields are skipped as noise. Attachments include their `id` for
+  `download_attachment`. It also fetches all
   comments via the dedicated paginated `/issue/{key}/comment` endpoint through `_fetch_all_comments()`
   — the comment array embedded in `fields=*all` is capped at Jira's default page size, so relying on
   it alone would silently drop comments on a busy ticket; each comment includes flattened `body`
@@ -167,6 +193,14 @@ in all four places when editing them.
   deterministic after the first confirmation instead of re-guessing from the git remote every
   time), `add_attachment` (multipart upload via a one-off `httpx.AsyncClient`, not `_client()` —
   its default `Content-Type: application/json` header would break the multipart body),
+  `download_attachment` (streams `/attachment/content/{id}` to a local file — a per-attachment
+  folder under the system temp dir by default, never overwriting an existing file — and for
+  PNG/JPEG/GIF/WebP up to 5 MB also returns an `Image` so the model sees the screenshot inline
+  via an MCP image content block. That endpoint redirects to Atlassian's media host with a
+  signed URL; httpx drops `Authorization` on the cross-origin redirect, which is required —
+  don't replace it with a client that forwards credentials. Attachment filenames are untrusted,
+  so `_safe_filename()` strips path components and leading dots; ids must be numeric; downloads
+  cap at 100 MB),
   `list_watchers` (returns `display_name`+`account_id` per watcher), `list_link_types`/
   `link_tickets` (creates an `/issueLink` between two tickets; call `list_link_types` first since
   valid names are site-specific), `list_favorite_filters`, and `set_working_issue`/
@@ -215,5 +249,7 @@ in all four places when editing them.
 
 Follow the existing pattern: decorate an `async def` with `@mcp.tool(name=..., description=...)`,
 type parameters with `pydantic.Field` for descriptions/defaults, use `_client()` for the HTTP call,
-call `await _raise_for_status(response)` before parsing, and return a plain dict/list (not the raw
-Jira JSON) shaped to what a model actually needs.
+call `await _raise_for_status(response)` before parsing, raise `ToolError` (not `ValueError`) for
+anything the model should read and act on, and return a plain dict/list (not the raw Jira JSON)
+shaped to what a model actually needs. Any free text the tool sends to Jira should go through
+`_adf_from_markdown()`, and any ADF it returns through `_text_from_adf()`.

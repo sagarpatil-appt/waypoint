@@ -166,7 +166,9 @@ This server is designed around one loop: **a developer working one ticket at a t
 editor.** Ask your assistant to "implement ABC-123" (or invoke the `implement_ticket` prompt
 directly) and it will:
 
-1. Read the ticket in full — description, comments, attachments (`get_ticket`)
+1. Read the ticket in full — description, comments, acceptance criteria and other custom fields,
+   parent/linked issues, and any screenshots or logs attached to it (`get_ticket`,
+   `download_attachment`)
 2. Verify it's actually in the right repo/workspace for that ticket's project — checking a saved
    `set_project_workspace` mapping first, or falling back to the git remote/directory name and
    asking you to confirm if it can't tell — before touching anything
@@ -198,11 +200,12 @@ project stays scoped to the ticket-to-code loop above.
 | `check_for_updates` | Check whether a newer Waypoint release is available on GitHub |
 | `search_tickets` | Search tickets with a raw JQL query (pages through results and returns `has_more` plus Jira's estimated `total`, so a capped result set is visible) |
 | `my_open_tickets` | List the current user's open (not Done) tickets |
-| `get_ticket` | Read a ticket's full details, including comments and attachments |
+| `get_ticket` | Read a ticket's full details as Markdown — description, comments, custom fields (acceptance criteria, story points, sprint), parent/sub-tasks, linked issues, web links, and attachments |
+| `download_attachment` | Download an attachment to a local file so it can be read; images (screenshots) are also shown to the model directly |
 | `list_issue_types` | List every issue type in a project, flagged sub-task or not — check this before create_ticket/create_subtask if the exact name isn't known |
 | `create_ticket` | Create a new ticket in a project — validates `issue_type` against the project's actual types rather than guessing |
 | `create_subtask` | Create a sub-task under an existing ticket — requires `issue_type` if the project has more than one sub-task type, rather than guessing |
-| `add_comment` | Add a comment to an existing ticket, in plain developer language, with any relevant screenshot attached |
+| `add_comment` | Add a comment to an existing ticket, in plain developer language, with any relevant screenshot attached — Markdown (code blocks, lists, links) renders properly on the ticket |
 | `get_available_transitions` | List the status transitions actually available for a ticket (status names are workflow-specific — check this before guessing) |
 | `update_ticket_status` | Move a ticket to a new status — accepts the status name ('In Progress') or the transition name ('Start Progress'), and a resolution when the transition requires one |
 | `update_ticket_assignee` | Reassign (or unassign) a ticket — accepts an email, display name, or accountId (accountId works even on sites that restrict user search) |
