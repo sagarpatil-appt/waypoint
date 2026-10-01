@@ -7,8 +7,8 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.prompts import base
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.prompts import base
 from pydantic import Field
 
 load_dotenv()
@@ -41,8 +41,9 @@ except json.JSONDecodeError:
 
 _ACCOUNT_ID_RE = re.compile(r"^[0-9a-f]{24}$|^\d+:[0-9a-fA-F-]{36}$")
 
-mcp = FastMCP(
+mcp = MCPServer(
     "Waypoint",
+    version=_VERSION,
     log_level="ERROR",
     instructions=(
         "Exposes Jira Cloud ticket operations. Before calling any tool other than "

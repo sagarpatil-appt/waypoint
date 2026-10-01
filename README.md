@@ -71,7 +71,7 @@ To package it:
 npm install -g @anthropic-ai/mcpb
 # vendor this project's Python dependencies into lib/, since (unlike Node) Claude Desktop
 # does not bundle a Python runtime or its own site-packages for you:
-pip install --target=lib "mcp[cli]>=1.8.0,<2.0.0" "httpx>=0.27.0" "python-dotenv>=1.1.0"
+pip install --target=lib "mcp[cli]>=2.2.0,<3.0.0" "httpx>=0.27.0" "python-dotenv>=1.1.0"
 mcpb pack
 ```
 

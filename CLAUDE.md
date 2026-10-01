@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**Waypoint** — an MCP (Model Context Protocol) server, built with `mcp[cli]`'s `FastMCP`, that
+**Waypoint** — an MCP (Model Context Protocol) server, built with `mcp[cli]`'s `MCPServer` (mcp 2.x), that
 exposes Jira ticket operations as tools over stdio. The entire server lives in
 `waypoint_server.py` — there is no package structure beyond that single file. The name is
 deliberately platform-neutral: today it only talks to Jira Cloud, but the intent is for the
@@ -60,7 +60,7 @@ unaddressed gap — adding it would mean a local OAuth callback server, client i
 registration, and refresh-token handling, a meaningfully different auth architecture from the
 rest of this server, not a small addition.
 
-The `FastMCP(...)` constructor's `instructions=` string (`waypoint_server.py`) is what teaches *any*
+The `MCPServer(...)` constructor's `instructions=` string (`waypoint_server.py`) is what teaches *any*
 connecting MCP client's model — not just this repo's CLAUDE.md, which end users of a published
 server won't have — to call `jira_connection_status` first and walk an unconfigured user through
 `setup_jira_connection`. If the setup flow changes, update that string too, not just the tool
@@ -85,7 +85,7 @@ docstrings. `README.md` documents the same flow for human readers.
 - `_raise_for_status()` is the single error path: any Jira API response >= 400 raises `ValueError`
   with the status code and truncated response body. Tools don't otherwise catch/wrap errors.
 - Tools are registered with `@mcp.tool(...)` and use `pydantic.Field` for parameter descriptions,
-  which FastMCP surfaces to MCP clients as the tool's input schema.
+  which MCPServer surfaces to MCP clients as the tool's input schema.
 - Current tools: `setup_jira_connection` (validates + persists credentials, see Configuration
   above), `jira_connection_status` (read-only connection check), `check_for_updates` (compares
   the installed version — read via `importlib.metadata.version("waypoint")`, so it always
