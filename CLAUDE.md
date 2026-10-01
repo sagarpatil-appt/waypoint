@@ -35,7 +35,13 @@ install at all — see `README.md` for the full one-command install story, plus 
 ## Configuration
 
 Connection state (`site_url`, `email`, `api_token`) lives in the in-memory `_config` dict
-(`waypoint_server.py`), seeded at import from a `.env` file (gitignored) if one exists:
+(`waypoint_server.py`), seeded at import from `ENV_PATH` — `~/.config/waypoint/.env` (honoring
+`XDG_CONFIG_HOME`; `%APPDATA%\waypoint\.env` on Windows) — if it exists. It deliberately never
+lives in the package's own directory: under a `uvx` install that's inside uv's cache, so a cache
+clean or version upgrade would wipe saved credentials (which is what happened before 0.2.1). A
+legacy `.env` next to `waypoint_server.py` (source checkouts, older installs) is still read and is
+copied to `ENV_PATH` on first run. Real environment variables (e.g. injected by the MCPB
+`user_config`) win over both files, since `load_dotenv` doesn't override existing vars. Keys:
 
 - `JIRA_SITE_URL` — e.g. `https://yourcompany.atlassian.net`
 - `JIRA_EMAIL` — Atlassian account email used for basic auth
@@ -48,8 +54,8 @@ every tool that calls `_client()` raises a clear `ValueError` pointing the calle
 `setup_jira_connection` until credentials are set. This is the intended "first-run" UX for a new
 user connecting through an MCP client: no manual file editing required. `setup_jira_connection`
 validates the given site URL/email/API token against Jira's `/myself` endpoint before accepting
-them, then persists them via `_save_env()`, which rewrites only the `JIRA_*` lines in `.env`
-(preserving anything else there) and chmods it `0600` — this now includes `JIRA_PROJECT_REPOS`
+them, then persists them via `_save_env()`, which rewrites only the `JIRA_*` lines in `ENV_PATH`
+(preserving anything else there), creating the directory `0700` and the file `0600` — this now includes `JIRA_PROJECT_REPOS`
 alongside the three connection fields, so `_save_env()`'s managed-keys tuple must stay in sync if
 another persisted field is ever added. `jira_connection_status` reports whether a connection is
 currently configured without exposing the token.
@@ -64,7 +70,12 @@ The `MCPServer(...)` constructor's `instructions=` string (`waypoint_server.py`)
 connecting MCP client's model — not just this repo's CLAUDE.md, which end users of a published
 server won't have — to call `jira_connection_status` first and walk an unconfigured user through
 `setup_jira_connection`. If the setup flow changes, update that string too, not just the tool
-docstrings. `README.md` documents the same flow for human readers.
+docstrings. `README.md` documents the same flow for human readers. That string, `get_ticket`'s
+description, and the `plan_ticket`/`implement_ticket` prompts also tell the model that ticket
+content is untrusted data, not instructions — anyone who can file or comment on a ticket can
+write into it, and this server runs locally next to git, a shell, and the user's credentials
+(the published Cursor + Jira MCP exfiltration attack worked exactly this way). Keep that guidance
+in all four places when editing them.
 
 ## Architecture
 
@@ -83,7 +94,11 @@ docstrings. `README.md` documents the same flow for human readers.
     matters in practice: a comment that's purely @mentions (no plain text) used to flatten to
     blank/whitespace, hiding real content.
 - `_raise_for_status()` is the single error path: any Jira API response >= 400 raises `ValueError`
-  with the status code and truncated response body. Tools don't otherwise catch/wrap errors.
+  with the status code and truncated response body. It also raises on an
+  `X-Seraph-LoginReason: AUTHENTICATED_FAILED`/`AUTHENTICATION_DENIED` header, because a revoked or
+  expired API token doesn't always 401 — endpoints that allow anonymous access (notably
+  `/search/jql`) return 200 with empty results, which would otherwise read as "no tickets". Tools
+  don't otherwise catch/wrap errors.
 - Tools are registered with `@mcp.tool(...)` and use `pydantic.Field` for parameter descriptions,
   which MCPServer surfaces to MCP clients as the tool's input schema.
 - Current tools: `setup_jira_connection` (validates + persists credentials, see Configuration
@@ -96,10 +111,13 @@ docstrings. `README.md` documents the same flow for human readers.
   it's checked on demand, not pushed), `search_tickets` (raw JQL search)
   and `my_open_tickets` (canned JQL:
   `assignee = currentUser() AND statusCategory != Done`, so callers don't need to write JQL for the
-  common "what's on my plate" case) — both go through the shared `_issue_summary()` helper and
-  return `{"total": ..., "returned": ..., "issues": [...]}` rather than a bare list, so a capped
-  result set (more Jira matches than `max_results`) is visible instead of silently looking
-  complete; each issue has `summary`, `status`, `issue_type`, `assignee`/`assignee_account_id`,
+  common "what's on my plate" case) — both go through the shared `_search_issues()` and
+  `_issue_summary()` helpers and return `{"total", "total_is_estimate", "returned", "has_more",
+  "issues"}` rather than a bare list, so a capped result set is visible instead of silently looking
+  complete. `/search/jql` (the replacement for the retired `/search`) returns no `total` at all, so
+  `_search_issues()` pages with `nextPageToken` up to `max_results` (100 per page), derives
+  `has_more` from whether Jira offered another page (exact), and takes `total` from
+  `/search/approximate-count` (an estimate; `None` if that call fails — never a made-up number); each issue has `summary`, `status`, `issue_type`, `assignee`/`assignee_account_id`,
   `reporter`/`reporter_account_id`, `priority`, `created`, `updated` (keep `_issue_summary()` as the
   single source of truth for this shape — don't let the two tools drift apart), `get_ticket`
   (fetches `fields=*all` for attachments/reporter/priority/timestamps, plus all
@@ -122,15 +140,22 @@ docstrings. `README.md` documents the same flow for human readers.
   `get_available_transitions`
   (lists valid status transitions for a ticket — status names are workflow-specific per project,
   e.g. one project used 'Started' instead of the more common 'In Progress', so check this rather
-  than guessing), `update_ticket_status` (resolves a
-  status name to a transition id via `/transitions` first — Jira requires the transition id, not
-  the status name, to actually change status), `update_ticket_assignee`/`add_watcher` (resolve an
+  than guessing), `update_ticket_status` (resolves to a
+  transition id via `/transitions?expand=transitions.fields` first — Jira requires the transition
+  id to change status. A transition's own name, e.g. 'Start Progress', and the status it leads to,
+  e.g. 'In Progress', are different strings, so it matches the transition name first and then the
+  destination status, refusing to pick when several transitions lead to the same status. If the
+  transition screen requires fields with no default, it fills `resolution` from its optional
+  param and otherwise raises an error naming the required fields and their allowed values, rather
+  than letting Jira reject the POST), `update_ticket_assignee`/`add_watcher` (resolve an
   email, display name, *or* accountId via the shared `_resolve_account_id()` helper — it tries the
   input as a literal accountId first via `GET /user`, which works regardless of site privacy
   settings, before falling back to `/user/search`; that fallback returns nothing on sites with
   GDPR/privacy-mode user search restricted, common on enterprise Jira, so callers who already have
   an accountId — e.g. from `list_watchers`'s or `get_ticket`'s `*_account_id` fields — can bypass
-  search entirely), `add_worklog` (time_spent is optional: if omitted, it requires an active
+  search entirely. `/user/search` is a fuzzy prefix match, so it ignores inactive users and only
+  accepts a single result or a single exact email/display-name match; otherwise it raises listing
+  the candidates' accountIds instead of assigning whoever came back first), `add_worklog` (time_spent is optional: if omitted, it requires an active
   `set_working_issue` timer for that ticket and auto-computes elapsed wall-clock time via
   `_fetch_time_tracking_config()` — reading the site's actual `workingHoursPerDay`/
   `workingDaysPerWeek` from `/configuration`, defaulting to 8/5 — and `_format_duration_jira()`;

@@ -37,13 +37,14 @@ uv cache clean waypoint
 ```
 
 Then reconnect the server in your MCP client (`/mcp` → reconnect, or restart the session). The
-next launch rebuilds Waypoint from the latest commit on GitHub.
+next launch rebuilds Waypoint from the latest commit on GitHub. Your saved Jira connection and
+`set_project_workspace` mappings are kept — they live in your user config directory (see
+"First-time setup" below), not in uv's cache.
 
-**You'll be asked for your Jira credentials again after upgrading.** With a `uvx` install, the
-`.env` file that `setup_jira_connection` writes lives inside uv's cache alongside the installed
-package, so it's removed along with the old build. Keep your API token handy, or create a new one
-at [id.atlassian.com](https://id.atlassian.com/manage-profile/security/api-tokens). Any
-`set_project_workspace` mappings are stored in the same file and will need to be confirmed again.
+**Upgrading from 0.2.0 or earlier with `uvx`?** Those versions saved credentials inside uv's
+cache, so the cache clean removes them and you'll be asked to connect once more. Keep your API
+token handy, or create a new one at
+[id.atlassian.com](https://id.atlassian.com/manage-profile/security/api-tokens).
 
 If the server still fails to start after upgrading — for example with
 `ModuleNotFoundError: No module named 'mcp.server.fastmcp'` from a pre-0.2.0 environment — clear
@@ -133,8 +134,13 @@ it will notice no connection is configured yet and ask you for three things:
    [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
 
 Just answer with those three values when asked. The assistant validates them against Jira before
-saving, and stores them in a local `.env` file (not committed to git) for future sessions — you
-won't be asked again unless you reconnect to a different site.
+saving, and stores them for future sessions in `~/.config/waypoint/.env` (`%APPDATA%\waypoint\.env`
+on Windows; `$XDG_CONFIG_HOME/waypoint/.env` if that's set), readable only by you. You won't be
+asked again unless you reconnect to a different site or your API token expires — if Jira rejects
+the saved token, tools say so and ask you to run setup again, rather than returning empty results.
+
+Installed from source before 0.2.1? Your existing `.env` next to `waypoint_server.py` is copied to
+the new location automatically on first run; you can delete the old one afterwards.
 
 ## Quick start
 
@@ -190,7 +196,7 @@ project stays scoped to the ticket-to-code loop above.
 | `jira_connection_status` | Check whether a Jira connection is currently configured |
 | `setup_jira_connection` | Validate and save Jira site URL, email, and API token |
 | `check_for_updates` | Check whether a newer Waypoint release is available on GitHub |
-| `search_tickets` | Search tickets with a raw JQL query (returns `total`/`returned` counts alongside `issues`, so a capped result set is visible) |
+| `search_tickets` | Search tickets with a raw JQL query (pages through results and returns `has_more` plus Jira's estimated `total`, so a capped result set is visible) |
 | `my_open_tickets` | List the current user's open (not Done) tickets |
 | `get_ticket` | Read a ticket's full details, including comments and attachments |
 | `list_issue_types` | List every issue type in a project, flagged sub-task or not — check this before create_ticket/create_subtask if the exact name isn't known |
@@ -198,7 +204,7 @@ project stays scoped to the ticket-to-code loop above.
 | `create_subtask` | Create a sub-task under an existing ticket — requires `issue_type` if the project has more than one sub-task type, rather than guessing |
 | `add_comment` | Add a comment to an existing ticket, in plain developer language, with any relevant screenshot attached |
 | `get_available_transitions` | List the status transitions actually available for a ticket (status names are workflow-specific — check this before guessing) |
-| `update_ticket_status` | Transition a ticket to a new status (e.g. 'In Progress', 'Done') |
+| `update_ticket_status` | Move a ticket to a new status — accepts the status name ('In Progress') or the transition name ('Start Progress'), and a resolution when the transition requires one |
 | `update_ticket_assignee` | Reassign (or unassign) a ticket — accepts an email, display name, or accountId (accountId works even on sites that restrict user search) |
 | `add_worklog` | Log time spent on a ticket; leave `time_spent` empty to auto-log real elapsed time since `set_working_issue` |
 | `list_projects` | List Jira projects visible to the user, to find a valid project key |
