@@ -106,8 +106,20 @@ docstrings. `README.md` documents the same flow for human readers.
   comments via the dedicated paginated `/issue/{key}/comment` endpoint through `_fetch_all_comments()`
   — the comment array embedded in `fields=*all` is capped at Jira's default page size, so relying on
   it alone would silently drop comments on a busy ticket; each comment includes flattened `body`
-  text, the raw `body_adf` JSON, and `author_account_id`), `create_ticket`, `create_subtask`
-  (looks up the parent's project automatically), `add_comment`, `get_available_transitions`
+  text, the raw `body_adf` JSON, and `author_account_id`), `list_issue_types` (lists every issue
+  type in a project via the shared `_fetch_project_issue_types()` helper, each flagged
+  `subtask: bool` — the one discovery tool behind both `create_ticket` and `create_subtask`'s
+  type validation, mirroring how `get_available_transitions`/`list_link_types` already make
+  callers check valid options instead of guessing), `create_ticket` (validates `issue_type`
+  against the project's non-subtask issue types before creating anything, raising a clear error
+  listing the valid names on a mismatch instead of letting Jira reject it deeper in the call),
+  `create_subtask` (looks up the parent's project automatically; its optional `issue_type` param
+  is required whenever the project has more than one sub-task type — it raises rather than
+  silently picking one, since guessing here previously created real tickets with the wrong
+  type, e.g. 'Story Bug' instead of 'Dev'), `add_comment` (its description explicitly asks the
+  model to write like a developer's quick note, not formal/robotic phrasing, and to call
+  `add_attachment` for any relevant screenshot instead of only describing it in text),
+  `get_available_transitions`
   (lists valid status transitions for a ticket — status names are workflow-specific per project,
   e.g. one project used 'Started' instead of the more common 'In Progress', so check this rather
   than guessing), `update_ticket_status` (resolves a
@@ -138,9 +150,6 @@ docstrings. `README.md` documents the same flow for human readers.
   `add_worklog`'s auto-elapsed-time feature above).
   Every tool that returns a ticket key also returns a `url` (`{site_url}/browse/{key}`).
   `create_ticket` accepts optional `priority`/`labels`/`components` (no fix-version support yet).
-  `create_subtask` looks up the parent project's actual subtask issue-type name via
-  `/project/{key}` (falling back to `"Subtask"`) rather than assuming that name — some Jira sites
-  use `"Sub-task"` instead.
 - Two MCP **prompts** are defined separately from tools via `@mcp.prompt(...)` — each returns a
   scripted instruction message (not a tool call) directing the calling model through a multi-step
   workflow using the tools above. Prompts and tools are distinct MCP primitives; don't conflate the
@@ -149,7 +158,9 @@ docstrings. `README.md` documents the same flow for human readers.
     calls `check_for_updates` in passing, explains the server's scope, shows real data from
     `my_open_tickets`, and explains `implement_ticket`/`plan_ticket`. Meant to be the first
     thing a new user runs.
-  - `plan_ticket`: read a ticket, assess scope, and create sub-tasks under it.
+  - `plan_ticket`: read a ticket, assess scope, and create sub-tasks under it — told to check
+    `list_issue_types` and pick the right type explicitly (e.g. 'Dev') rather than letting
+    `create_subtask` guess when a project has more than one.
   - `implement_ticket`: the primary intended workflow for this server — read a ticket end to end,
     verify the workspace (`get_project_workspace` first for a deterministic match, falling back to
     checking `git remote -v`/directory name and asking the user to confirm if it can't tell, then
@@ -159,7 +170,9 @@ docstrings. `README.md` documents the same flow for human readers.
     write the code in the relevant project using normal file/code tools (not a Jira tool —
     implementation happens outside this server entirely), verify it (tests/build/lint) and stop
     without committing if verification still fails after a reasonable fix attempt, comment a
-    summary back and log time via `add_worklog` (auto-computed elapsed time by default), bias the
+    summary back in plain developer language (not formal/robotic phrasing) with any relevant
+    screenshot attached via `add_attachment` rather than only described in text, and log time via
+    `add_worklog` (auto-computed elapsed time by default), bias the
     next status toward a review-style status rather than done/closed, then — after checking the
     repo's existing branch-naming convention — ask the user whether to commit directly or on a new
     branch, stage only the files this task touched (never a blanket add), commit as
