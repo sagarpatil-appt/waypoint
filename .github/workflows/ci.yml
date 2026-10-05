@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python: "3.13"
+          - os: windows-latest
+            python: "3.13"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      # --locked fails the build if uv.lock is out of date with pyproject.toml.
+      - name: Install
+        run: uv sync --locked
+
+      - name: Test
+        run: uv run pytest -v
+
+  package:
+    name: Build and install the package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.13"
+
+      - name: Build
+        run: uv build
+
+      # Install the wheel the way end users get it (uvx, no dev dependencies, no source tree)
+      # and make sure the console script starts and answers an MCP initialize.
+      - name: Smoke-test the built wheel
+        working-directory: ${{ runner.temp }}
+        run: |
+          uvx --from "$(ls "$GITHUB_WORKSPACE"/dist/*.whl)" python - <<'PY'
+          import anyio, shutil
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          async def main():
+              params = StdioServerParameters(command=shutil.which("waypoint"), args=[])
+              async with stdio_client(params) as (read, write):
+                  async with ClientSession(read, write) as session:
+                      init = await session.initialize()
+                      tools = (await session.list_tools()).tools
+                      assert init.server_info.name == "Waypoint", init.server_info
+                      assert len(tools) > 20, len(tools)
+                      print(f"{init.server_info.name} {init.server_info.version}: {len(tools)} tools")
+
+          anyio.run(main)
+          PY

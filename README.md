@@ -122,6 +122,41 @@ Notes:
   `JIRA_EMAIL`, `JIRA_API_TOKEN` from the environment the same way whether they come from a local
   `.env` file or from Claude Desktop injecting `user_config` values as env vars at launch.
 
+## Read-only mode and limiting tools
+
+Set these in your MCP client's server config (`"env": {...}` in `.mcp.json`, or `-e` with
+`claude mcp add`) to control what Waypoint is allowed to do:
+
+| Variable | Effect |
+|---|---|
+| `WAYPOINT_READ_ONLY=true` | Hide every tool that changes Jira — comments, status, assignee, worklogs, new tickets, links, attachments, watchers. Reading tickets, searching, and downloading attachments still work, and the assistant is told to describe what it would have changed instead. |
+| `WAYPOINT_DISABLED_TOOLS=add_worklog,update_ticket_assignee` | Hide specific tools. |
+| `WAYPOINT_ENABLED_TOOLS=get_ticket,my_open_tickets,search_tickets` | Expose only these tools. |
+
+Hidden tools can't be called at all, not just unlisted. The connection tools
+(`jira_connection_status`, `setup_jira_connection`, `check_for_updates`) are always available. A
+misspelled tool name stops the server with an error naming it, rather than being ignored. The
+Claude Desktop extension has a **Read-only mode** checkbox in its install form.
+
+```bash
+claude mcp add waypoint --scope user -e WAYPOINT_READ_ONLY=true -- uvx --from git+https://github.com/sagarpatil-appt/waypoint waypoint
+```
+
+Every tool also declares standard MCP hints (read-only, destructive, idempotent), so clients that
+support them can, for example, auto-approve read-only tools and ask before destructive ones.
+
+## Development
+
+```bash
+git clone https://github.com/sagarpatil-appt/waypoint
+cd waypoint
+uv sync
+uv run pytest
+```
+
+The tests use a fake Jira, so they need no account or network access. CI runs them on Python
+3.10–3.14 and checks that the built package installs and starts via `uvx`.
+
 ## First-time setup via chat (command-line / manual-install path)
 
 If you installed via the CLI (above) rather than the one-click `.mcpb`, you don't need to create a
@@ -185,6 +220,10 @@ directly) and it will:
    convention), stage only the files it actually touched, and commit as `TICKET-KEY: <summary>`
 9. Ask again before pushing — pushing always needs a separate yes, even if you already said
    "commit directly" — and offer to open a PR/MR if a new branch was pushed
+10. Link the pushed PR, branch, or commit back on the ticket (`add_remote_link`), so reviewers can
+    get from the ticket to the code. The ticket key stays in the branch name, commit message, and
+    PR title, so if your Jira site has a GitHub/GitLab/Bitbucket integration, its Development panel
+    picks the work up too
 
 This is deliberately not trying to be a full Jira administration tool — no sprints, boards, or
 epics here. If you need broad Jira/Confluence coverage, Atlassian's own
@@ -213,6 +252,7 @@ project stays scoped to the ticket-to-code loop above.
 | `list_projects` | List Jira projects visible to the user, to find a valid project key |
 | `set_project_workspace` / `get_project_workspace` | Remember which local repo (and subdirectory) a Jira project maps to, so `implement_ticket` can verify the workspace without asking every time |
 | `add_attachment` | Attach a local file to a ticket |
+| `add_remote_link` | Add a web link (PR, branch, commit, doc) to a ticket's Links panel — linking the same URL again updates it instead of duplicating |
 | `add_watcher` / `list_watchers` | Add or list watchers on a ticket (accepts/returns accountId too) |
 | `list_link_types` / `link_tickets` | List valid link types (blocks, relates to, etc.) and link two tickets together |
 | `list_favorite_filters` | List the user's saved Jira filters, with JQL to run via `search_tickets` |

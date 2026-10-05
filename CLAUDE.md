@@ -31,6 +31,36 @@ use. Use `mcp dev waypoint_server.py` (from the `mcp[cli]` package) to inspect/t
 via the MCP Inspector. `uvx --from <path-or-git-url> waypoint` runs it with no prior clone/
 install at all — see `README.md` for the full one-command install story, plus the alternate MCPB
 (Claude Desktop one-click extension) packaging path via `manifest.json`.
+`pyproject.toml` names the module explicitly (`[tool.setuptools] py-modules`), so the `tests/`
+directory never ends up in the wheel.
+
+## Testing
+
+```bash
+uv run pytest            # full suite, ~5s; no network, no Jira account needed
+```
+
+`tests/conftest.py` isolates every run from the developer's real config *before* importing the
+server: a throwaway `XDG_CONFIG_HOME`/`APPDATA` holding an empty `.env` (so the legacy-file
+migration never copies a real `.env` into it) and empty `JIRA_*` env vars, which `load_dotenv`
+won't override. Its `jira` fixture swaps `_client()` for an `httpx.MockTransport`-backed
+`FakeJira` — register responses with `jira.on(method, path, ...)` (path relative to
+`/rest/api/3`, or a full URL for other hosts; a callable for dynamic responses) and inspect what
+was sent with `jira.sent()`/`jira.sent_json()`. Call tools via `conftest.call(name, **args)`,
+which goes through `mcp.call_tool` so argument validation, `Field` defaults, and `ToolError`
+surfacing are exercised the way a client sees them. `tests/test_server.py` also runs the real
+server over stdio (default, read-only, and filtered modes). Outgoing ADF is checked against
+Atlassian's schema, vendored at `tests/fixtures/adf-schema-v1.json` (see the README there).
+
+A few tests guard invariants rather than features — keep them passing rather than deleting them:
+every registered tool has an entry in `_TOOL_HINTS` (and vice versa); every non-read-only tool is
+either in `_JIRA_WRITE_TOOLS` or the test's explicit local-state set, so a new write tool can't
+silently stay enabled in read-only mode; and no `raise ValueError` exists in the server (see
+`ToolError` under Architecture).
+
+CI (`.github/workflows/ci.yml`) runs the suite on Python 3.10–3.14 (Ubuntu) plus macOS and
+Windows on 3.13, with `uv sync --locked` (fails if `uv.lock` is stale), and separately builds the
+wheel and smoke-tests it through `uvx` the way end users install it.
 
 ## Configuration
 
@@ -48,6 +78,20 @@ copied to `ENV_PATH` on first run. Real environment variables (e.g. injected by 
 - `JIRA_API_TOKEN` — Atlassian API token
 - `JIRA_PROJECT_REPOS` — JSON-encoded `{project_key: {"repo_path": ..., "subdirectory": ...}}`,
   populated via the `set_project_workspace` tool (see Architecture) rather than hand-edited.
+
+Tool exposure is controlled by env vars (set in the MCP client's server config, or via the MCPB
+`read_only` option), applied once at import by `_apply_tool_filters()` with `mcp.remove_tool()`,
+so filtered tools are neither listed nor callable:
+
+- `WAYPOINT_READ_ONLY=true` removes `_JIRA_WRITE_TOOLS` (everything that changes Jira). Tools that
+  only touch local state — setup, workspace mapping, the working-issue timer, downloads — stay.
+  It also appends `_READ_ONLY_NOTE` to the server instructions and all three prompts, telling the
+  model to skip write steps and say what it would have done.
+- `WAYPOINT_ENABLED_TOOLS` (allowlist) / `WAYPOINT_DISABLED_TOOLS` (denylist), comma-separated.
+- `_ALWAYS_AVAILABLE_TOOLS` (`jira_connection_status`, `setup_jira_connection`,
+  `check_for_updates`) survive every filter — the instructions depend on them.
+- An unknown tool name in either list exits the server with an error naming it. That's
+  deliberate: a typo in a denylist must not silently leave the intended tool enabled.
 
 The server does **not** fail to start if `.env` is missing/incomplete — it starts unconfigured and
 every tool that calls `_client()` raises a clear `ToolError` pointing the caller at
@@ -115,7 +159,13 @@ in all four places when editing them.
   `/search/jql`) return 200 with empty results, which would otherwise read as "no tickets". Tools
   don't otherwise catch/wrap errors.
 - Tools are registered with `@mcp.tool(...)` and use `pydantic.Field` for parameter descriptions,
-  which MCPServer surfaces to MCP clients as the tool's input schema.
+  which MCPServer surfaces to MCP clients as the tool's input schema. Every tool also passes
+  `annotations=_TOOL_HINTS[name]` — MCP `ToolAnnotations` built by `_hints()`, which clients use
+  to e.g. auto-approve read-only tools and warn on destructive ones. Be honest in these:
+  `destructive` means it can overwrite/replace existing data (status, assignee, saved config),
+  not just add to it; `idempotent` means repeating the call changes nothing further
+  (`add_remote_link` is, via `globalId`; `add_comment` isn't); `external=False` marks tools that
+  only touch local state.
 - Current tools: `setup_jira_connection` (validates + persists credentials, see Configuration
   above), `jira_connection_status` (read-only connection check), `check_for_updates` (compares
   the installed version — read via `importlib.metadata.version("waypoint")`, so it always
@@ -203,7 +253,16 @@ in all four places when editing them.
   cap at 100 MB),
   `list_watchers` (returns `display_name`+`account_id` per watcher), `list_link_types`/
   `link_tickets` (creates an `/issueLink` between two tickets; call `list_link_types` first since
-  valid names are site-specific), `list_favorite_filters`, and `set_working_issue`/
+  valid names are site-specific), `add_remote_link` (POSTs `/issue/{key}/remotelink` — a web link
+  in the ticket's Links panel, used by `implement_ticket` to link the pushed PR/branch/commit.
+  `globalId` is `url=<url>` (sha256 of the URL if that would exceed Jira's 255-char limit), and
+  Jira updates rather than duplicates a link with an existing `globalId`, so re-running the
+  workflow is idempotent; 201 means created, 200 updated. Only http(s) URLs are accepted, and
+  github.com/gitlab.com/bitbucket.org links get an `application` so Jira groups them. This is a
+  plain web link, not Jira's Development panel — that panel is fed only by a site's forge
+  integration app matching the issue key in branch/commit/PR names, which no REST call here can
+  write to; hence the prompt's insistence on keeping the key in all three),
+  `list_favorite_filters`, and `set_working_issue`/
   `get_working_issue` (in-memory `_working_issue` dict — `{"key": ..., "started_at": ...}`,
   session-scoped only, resets on server restart, no persistence by design; `started_at` backs
   `add_worklog`'s auto-elapsed-time feature above).
@@ -237,7 +296,11 @@ in all four places when editing them.
     branch, stage only the files this task touched (never a blanket add), commit as
     `{ISSUE-KEY}: <summary>` via normal git tools, ask again before pushing (a separate
     confirmation even if the user already chose "commit directly", since push is harder to reverse
-    and affects shared state), and offer to open a PR/MR if a new branch was pushed.
+    and affects shared state), offer to open a PR/MR (title prefixed `{ISSUE-KEY}: `) if a new
+    branch was pushed, and finally link whatever was actually pushed — PR, else branch, else
+    commit — back on the ticket via `add_remote_link`, never a local-only commit. Branch names
+    keep the issue key even when following the repo's own convention, so a site's forge
+    integration can populate Jira's Development panel too.
 
   **Design intent:** this server is scoped for a single developer working one ticket at a time
   inside their editor (fetch → analyze → flag gap or implement → status/worklog as a side effect of
@@ -252,4 +315,6 @@ type parameters with `pydantic.Field` for descriptions/defaults, use `_client()`
 call `await _raise_for_status(response)` before parsing, raise `ToolError` (not `ValueError`) for
 anything the model should read and act on, and return a plain dict/list (not the raw Jira JSON)
 shaped to what a model actually needs. Any free text the tool sends to Jira should go through
-`_adf_from_markdown()`, and any ADF it returns through `_text_from_adf()`.
+`_adf_from_markdown()`, and any ADF it returns through `_text_from_adf()`. Add the tool to
+`_TOOL_HINTS` with accurate annotations, and if it changes Jira, to `_JIRA_WRITE_TOOLS` too (the
+tests fail until both are done). Add tests using the `jira` fixture, and run `uv run pytest`.

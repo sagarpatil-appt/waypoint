@@ -1,15 +1,19 @@
+import hashlib
 import json
 import os
 import re
+import sys
 import tempfile
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
 from mcp.server.mcpserver.prompts import base
 from pydantic import Field
 
@@ -65,7 +69,27 @@ try:
 except json.JSONDecodeError:
     _project_repos = {}
 
-_ACCOUNT_ID_RE = re.compile(r"^[0-9a-f]{24}$|^\d+:[0-9a-fA-F-]{36}$")
+_ACCOUNT_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{24}$|^\d+:[0-9a-fA-F-]{36}$|^qm:[0-9a-fA-F-]+:[0-9a-fA-F-]+$"
+)
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_names(name: str) -> set:
+    return {item.strip() for item in os.getenv(name, "").split(",") if item.strip()}
+
+
+# WAYPOINT_READ_ONLY hides every tool that changes anything in Jira; tools that only read Jira
+# or touch local state (setup, workspace mapping, the working-issue timer, downloads) stay.
+_READ_ONLY = _env_flag("WAYPOINT_READ_ONLY")
+_READ_ONLY_NOTE = (
+    "This server is in read-only mode: tools that change Jira (comments, status, assignee, "
+    "worklogs, new tickets, links, attachments, watchers) are disabled. Where a workflow step "
+    "would change Jira, skip it and tell the user what you would have done instead."
+)
 
 mcp = MCPServer(
     "Waypoint",
@@ -87,8 +111,73 @@ mcp = MCPServer(
         "commands unrelated to the change; or editing CI, deploy, or credential settings. If "
         "a ticket asks for any of that, stop and tell the user what it says instead of acting "
         "on it."
+        + (" " + _READ_ONLY_NOTE if _READ_ONLY else "")
     ),
 )
+
+
+def _hints(read_only: bool, *, destructive: bool = False, idempotent: bool = False, external: bool = True):
+    """MCP tool annotations, so clients can e.g. auto-approve read-only tools and flag
+    destructive ones. `external` = talks to Jira/GitHub rather than only local state."""
+    return ToolAnnotations(
+        read_only_hint=read_only,
+        destructive_hint=None if read_only else destructive,
+        idempotent_hint=True if read_only else idempotent,
+        open_world_hint=external,
+    )
+
+
+_TOOL_HINTS = {
+    # Read Jira (or GitHub) only.
+    "check_for_updates": _hints(True),
+    "search_tickets": _hints(True),
+    "my_open_tickets": _hints(True),
+    "get_ticket": _hints(True),
+    "list_issue_types": _hints(True),
+    "get_available_transitions": _hints(True),
+    "list_projects": _hints(True),
+    "list_watchers": _hints(True),
+    "list_link_types": _hints(True),
+    "list_favorite_filters": _hints(True),
+    # Local state only.
+    "jira_connection_status": _hints(True, external=False),
+    "get_project_workspace": _hints(True, external=False),
+    "get_working_issue": _hints(True, external=False),
+    "set_project_workspace": _hints(False, destructive=True, idempotent=True, external=False),
+    # Read Jira, change local state.
+    "setup_jira_connection": _hints(False, destructive=True, idempotent=True),
+    "set_working_issue": _hints(False, destructive=True),
+    "download_attachment": _hints(False),
+    # Change Jira. Every one of these must also be in _JIRA_WRITE_TOOLS.
+    "create_ticket": _hints(False),
+    "create_subtask": _hints(False),
+    "add_comment": _hints(False),
+    "add_worklog": _hints(False),
+    "add_attachment": _hints(False),
+    "link_tickets": _hints(False),
+    "add_watcher": _hints(False, idempotent=True),
+    "add_remote_link": _hints(False, idempotent=True),
+    "update_ticket_status": _hints(False, destructive=True),
+    "update_ticket_assignee": _hints(False, destructive=True, idempotent=True),
+}
+
+# Tools that change Jira itself — removed in read-only mode.
+_JIRA_WRITE_TOOLS = frozenset(
+    {
+        "create_ticket",
+        "create_subtask",
+        "add_comment",
+        "add_worklog",
+        "add_attachment",
+        "link_tickets",
+        "add_watcher",
+        "add_remote_link",
+        "update_ticket_status",
+        "update_ticket_assignee",
+    }
+)
+# Needed to get connected and to discover the server at all; never filtered out.
+_ALWAYS_AVAILABLE_TOOLS = frozenset({"jira_connection_status", "setup_jira_connection", "check_for_updates"})
 
 
 def _is_configured() -> bool:
@@ -475,8 +564,9 @@ def _text_from_adf(adf) -> str:
 
 
 def _looks_like_account_id(value: str) -> bool:
-    """Heuristic for Atlassian cloud accountIds, e.g. '5b10a2844c20165700ede21g' or the
-    older '712020:xxxxxxxx-xxxx-...' form, so callers who already have one can skip
+    """Heuristic for Atlassian cloud accountIds — 24 hex chars (e.g. '5d53f3cbc6b9320d9ea5bdc2'),
+    the older '557058:<uuid>' form, or a service-desk customer's 'qm:<hex>:<hex>' — so callers
+    who already have one can skip
     /user/search entirely (that endpoint returns nothing on sites with GDPR/privacy-mode
     user search restricted, which is common on enterprise Jira sites)."""
     return bool(_ACCOUNT_ID_RE.match(value.strip()))
@@ -609,6 +699,7 @@ async def _fetch_all_comments(client: httpx.AsyncClient, issue_key: str) -> list
 
 @mcp.tool(
     name="setup_jira_connection",
+    annotations=_TOOL_HINTS["setup_jira_connection"],
     description=(
         "Connect this server to a Jira Cloud site for the first time (or reconnect to a "
         "different one). Validates the site URL, email, and API token against Jira before "
@@ -664,6 +755,7 @@ async def setup_jira_connection(
 
 @mcp.tool(
     name="jira_connection_status",
+    annotations=_TOOL_HINTS["jira_connection_status"],
     description="Check whether this server is currently connected to a Jira site.",
 )
 async def jira_connection_status():
@@ -678,6 +770,7 @@ async def jira_connection_status():
 
 @mcp.tool(
     name="check_for_updates",
+    annotations=_TOOL_HINTS["check_for_updates"],
     description=(
         "Check whether a newer version of Waypoint is available. Safe to call any time; "
         "worth checking occasionally since this server has no other way to notify you of "
@@ -793,6 +886,7 @@ async def _search_issues(client: httpx.AsyncClient, jql: str, max_results: int) 
 
 @mcp.tool(
     name="search_tickets",
+    annotations=_TOOL_HINTS["search_tickets"],
     description=(
         "Search Jira tickets using JQL (Jira Query Language) and return a summary of matching "
         "issues. has_more says whether matches beyond max_results were left out, so a capped "
@@ -812,6 +906,7 @@ async def search_tickets(
 
 @mcp.tool(
     name="my_open_tickets",
+    annotations=_TOOL_HINTS["my_open_tickets"],
     description="List the current user's open (not Done) Jira tickets, most recently updated first.",
 )
 async def my_open_tickets(
@@ -912,6 +1007,7 @@ async def _fetch_remote_links(client: httpx.AsyncClient, issue_key: str) -> list
 
 @mcp.tool(
     name="get_ticket",
+    annotations=_TOOL_HINTS["get_ticket"],
     description=(
         "Read the full details of a single Jira ticket by its key (e.g. 'ABC-123'): description "
         "and comments as Markdown, plus parent/epic, sub-tasks, linked issues, web links (e.g. "
@@ -998,6 +1094,7 @@ async def _fetch_project_issue_types(client: httpx.AsyncClient, project_key: str
 
 @mcp.tool(
     name="list_issue_types",
+    annotations=_TOOL_HINTS["list_issue_types"],
     description=(
         "List every issue type available in a Jira project — including whether each one is a "
         "sub-task type. Check this before create_ticket or create_subtask whenever the exact "
@@ -1020,6 +1117,7 @@ async def list_issue_types(
 
 @mcp.tool(
     name="create_ticket",
+    annotations=_TOOL_HINTS["create_ticket"],
     description=(
         "Create a new Jira ticket in a project. issue_type defaults to 'Task', but if that's "
         "not clearly right for this project, call list_issue_types first and pass the exact "
@@ -1074,6 +1172,7 @@ async def create_ticket(
 
 @mcp.tool(
     name="create_subtask",
+    annotations=_TOOL_HINTS["create_subtask"],
     description=(
         "Create a sub-task under an existing Jira ticket. If the project has more than one "
         "sub-task issue type, issue_type is required — call list_issue_types first to see "
@@ -1142,6 +1241,7 @@ async def create_subtask(
 
 @mcp.tool(
     name="add_comment",
+    annotations=_TOOL_HINTS["add_comment"],
     description=(
         "Add a comment to an existing Jira ticket. Write it the way a developer would type a "
         "quick note themselves — plain, natural language, not formal or robotic phrasing. "
@@ -1166,6 +1266,7 @@ async def add_comment(
 
 @mcp.tool(
     name="get_available_transitions",
+    annotations=_TOOL_HINTS["get_available_transitions"],
     description=(
         "List the status transitions currently available for a ticket. Check this before "
         "calling update_ticket_status if the exact status name isn't already known — status "
@@ -1186,6 +1287,7 @@ async def get_available_transitions(
 
 @mcp.tool(
     name="update_ticket_status",
+    annotations=_TOOL_HINTS["update_ticket_status"],
     description=(
         "Change a Jira ticket's status. Accepts either the target status name (e.g. "
         "'In Progress', 'Done') or the workflow transition's own name (e.g. 'Start Progress') "
@@ -1270,6 +1372,7 @@ async def update_ticket_status(
 
 @mcp.tool(
     name="update_ticket_assignee",
+    annotations=_TOOL_HINTS["update_ticket_assignee"],
     description=(
         "Change who a Jira ticket is assigned to. Pass an email, display name, or Atlassian "
         "accountId to look up (accountId works even on sites that restrict user search under "
@@ -1300,6 +1403,7 @@ async def update_ticket_assignee(
 
 @mcp.tool(
     name="add_worklog",
+    annotations=_TOOL_HINTS["add_worklog"],
     description=(
         "Log time spent working on a Jira ticket. Leave time_spent empty to auto-compute it "
         "from the real elapsed wall-clock time since set_working_issue was called for this "
@@ -1352,6 +1456,7 @@ async def add_worklog(
 
 @mcp.tool(
     name="list_projects",
+    annotations=_TOOL_HINTS["list_projects"],
     description="List Jira projects visible to the current user, to find a valid project key before creating a ticket.",
 )
 async def list_projects():
@@ -1365,6 +1470,7 @@ async def list_projects():
 
 @mcp.tool(
     name="set_project_workspace",
+    annotations=_TOOL_HINTS["set_project_workspace"],
     description=(
         "Remember which local repo (and optional subdirectory, for monorepos) a Jira project's "
         "tickets get implemented in. Once set, implement_ticket can verify the workspace "
@@ -1393,6 +1499,7 @@ async def set_project_workspace(
 
 @mcp.tool(
     name="get_project_workspace",
+    annotations=_TOOL_HINTS["get_project_workspace"],
     description="Look up the local repo (and subdirectory, if any) previously set for a Jira project via set_project_workspace.",
 )
 async def get_project_workspace(
@@ -1406,6 +1513,7 @@ async def get_project_workspace(
 
 @mcp.tool(
     name="add_attachment",
+    annotations=_TOOL_HINTS["add_attachment"],
     description="Attach a local file to a Jira ticket.",
 )
 async def add_attachment(
@@ -1436,6 +1544,74 @@ async def add_attachment(
     return [{"filename": a["filename"], "size": a["size"], "url": a["content"]} for a in data]
 
 
+# Hosts whose links Jira should group under a named application in the ticket's "Links" panel.
+_FORGE_APPLICATIONS = {
+    "github.com": {"type": "com.github", "name": "GitHub"},
+    "gitlab.com": {"type": "com.gitlab", "name": "GitLab"},
+    "bitbucket.org": {"type": "com.atlassian.bitbucket", "name": "Bitbucket"},
+}
+
+
+@mcp.tool(
+    name="add_remote_link",
+    annotations=_TOOL_HINTS["add_remote_link"],
+    description=(
+        "Add a web link to a Jira ticket's Links panel — e.g. the pull request, pushed branch, "
+        "or commit that implements it, or a related doc. Call this after pushing work for a "
+        "ticket so the code is reachable from the ticket itself. Only link URLs that actually "
+        "exist (pushed to the remote / PR already opened), never a local-only commit. Linking "
+        "the same URL again updates the existing link instead of adding a duplicate."
+    ),
+)
+async def add_remote_link(
+    issue_key: str = Field(description="Jira issue key, e.g. 'ABC-123'"),
+    url: str = Field(description="Full http(s) URL to link, e.g. the pull request URL"),
+    title: str = Field(
+        description="Link text shown on the ticket, e.g. 'PR #42: Fix Safari login 500'"
+    ),
+    relationship: str = Field(
+        default="",
+        description=(
+            "Short label grouping the link on the ticket, e.g. 'pull request', 'branch', "
+            "'commit'; leave empty for Jira's default ('links to')"
+        ),
+    ),
+    summary: str = Field(default="", description="Optional one-line description shown with the link"),
+):
+    url = url.strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ToolError(f"'{url}' is not an http(s) URL — pass the full link, e.g. the PR's URL.")
+    if not title.strip():
+        raise ToolError("title is required — e.g. 'PR #42: <PR title>' or 'Branch ABC-123-fix-login'.")
+
+    # Jira treats globalId as the link's identity on this ticket: POSTing an existing globalId
+    # updates that link instead of creating a second one. Keyed on the URL (hashed if it's
+    # longer than the 255-char limit) so re-running the workflow doesn't pile up duplicates.
+    global_id = f"url={url}" if len(url) <= 251 else f"sha256={hashlib.sha256(url.encode()).hexdigest()}"
+    link_object: dict = {"url": url, "title": title.strip()[:255]}
+    if summary.strip():
+        link_object["summary"] = summary.strip()
+    payload: dict = {"globalId": global_id, "object": link_object}
+    if relationship.strip():
+        payload["relationship"] = relationship.strip()
+    application = _FORGE_APPLICATIONS.get(parsed.netloc.lower().removeprefix("www."))
+    if application:
+        payload["application"] = application
+
+    async with _client() as client:
+        response = await client.post(f"/issue/{issue_key}/remotelink", json=payload)
+        await _raise_for_status(response)
+
+    return {
+        "issue_key": issue_key,
+        "url": url,
+        "title": link_object["title"],
+        "status": "updated existing link" if response.status_code == 200 else "linked",
+        "ticket_url": f"{_config['site_url']}/browse/{issue_key}",
+    }
+
+
 _ATTACHMENT_MAX_BYTES = 100 * 1024 * 1024
 _INLINE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 _INLINE_IMAGE_FORMATS = {"image/png": "png", "image/jpeg": "jpeg", "image/gif": "gif", "image/webp": "webp"}
@@ -1460,6 +1636,7 @@ def _unique_path(directory: Path, filename: str) -> Path:
 
 @mcp.tool(
     name="download_attachment",
+    annotations=_TOOL_HINTS["download_attachment"],
     description=(
         "Download a Jira attachment (by the id from get_ticket's attachments list) to a local "
         "file, so its contents can be read — e.g. a screenshot, log, or spec referenced by the "
@@ -1541,6 +1718,7 @@ async def download_attachment(
 
 @mcp.tool(
     name="add_watcher",
+    annotations=_TOOL_HINTS["add_watcher"],
     description=(
         "Add a watcher to a Jira ticket by email, display name, or Atlassian accountId "
         "(accountId works even on sites that restrict user search under GDPR/privacy mode)."
@@ -1563,6 +1741,7 @@ async def add_watcher(
 
 @mcp.tool(
     name="list_watchers",
+    annotations=_TOOL_HINTS["list_watchers"],
     description="List the watchers on a Jira ticket, including each one's accountId.",
 )
 async def list_watchers(
@@ -1581,6 +1760,7 @@ async def list_watchers(
 
 @mcp.tool(
     name="list_link_types",
+    annotations=_TOOL_HINTS["list_link_types"],
     description="List the valid issue link type names for this Jira site (used by link_tickets).",
 )
 async def list_link_types():
@@ -1597,6 +1777,7 @@ async def list_link_types():
 
 @mcp.tool(
     name="link_tickets",
+    annotations=_TOOL_HINTS["link_tickets"],
     description=(
         "Create a link between two Jira tickets (e.g. blocks, relates to, duplicates). "
         "Call list_link_types first if the exact link type name isn't already known."
@@ -1621,6 +1802,7 @@ async def link_tickets(
 
 @mcp.tool(
     name="list_favorite_filters",
+    annotations=_TOOL_HINTS["list_favorite_filters"],
     description=(
         "List the current user's favourite (saved) Jira filters, including each filter's JQL "
         "so it can be run via search_tickets."
@@ -1637,6 +1819,7 @@ async def list_favorite_filters():
 
 @mcp.tool(
     name="set_working_issue",
+    annotations=_TOOL_HINTS["set_working_issue"],
     description=(
         "Mark a Jira ticket as the current working issue for this session, so its key doesn't "
         "need to be repeated in every subsequent request. Also starts this ticket's elapsed-time "
@@ -1658,10 +1841,15 @@ async def set_working_issue(
 
 @mcp.tool(
     name="get_working_issue",
+    annotations=_TOOL_HINTS["get_working_issue"],
     description="Get the Jira ticket currently marked as the working issue for this session, if any.",
 )
 async def get_working_issue():
     return {"working_issue": _working_issue["key"]}
+
+
+def _prompt_read_only_note() -> str:
+    return f"\n    Note: {_READ_ONLY_NOTE}\n" if _READ_ONLY else ""
 
 
 @mcp.prompt(
@@ -1696,7 +1884,7 @@ def tour() -> list[base.Message]:
        "let me know if you have questions."
     """
 
-    return [base.UserMessage(prompt)]
+    return [base.UserMessage(prompt + _prompt_read_only_note())]
 
 
 @mcp.prompt(
@@ -1732,7 +1920,7 @@ def plan_ticket(
     5. Summarize what you found and what sub-tasks you created.
     """
 
-    return [base.UserMessage(prompt)]
+    return [base.UserMessage(prompt + _prompt_read_only_note())]
 
 
 @mcp.prompt(
@@ -1812,7 +2000,9 @@ def implement_ticket(
        i. Before creating a branch or committing, check this repo's existing convention (e.g.
           `git branch -a`, `git log --oneline -20` for recently merged branch names) rather
           than inventing your own naming scheme. If no clear convention exists, default to
-          `{issue_key}-<short-kebab-slug>`.
+          `{issue_key}-<short-kebab-slug>`. Either way, keep {issue_key} in the branch name:
+          if the site has a GitHub/GitLab/Bitbucket integration, Jira's Development panel
+          matches branches, commits, and PRs to the ticket by that key.
        j. Ask the user whether to commit directly on the current branch or create a new
           branch for {issue_key} first (using the convention from step i). Do not decide this
           yourself.
@@ -1827,14 +2017,50 @@ def implement_ticket(
           confirm.
        n. If a new branch was pushed, ask the user whether to open a pull/merge request. If
           yes, use whatever forge tooling is available (e.g. `gh pr create` for GitHub, `glab
-          mr create` for GitLab); if no such CLI is available, give the user the compare URL
+          mr create` for GitLab), with a title starting `{issue_key}: ` and the ticket URL in
+          the description; if no such CLI is available, give the user the compare URL
           instead of guessing at API calls. Skip this step entirely if they committed directly
           to an existing branch — there's no new branch to open a PR from.
+       o. If anything was pushed, link it from the ticket with add_remote_link so reviewers
+          can get from {issue_key} to the code: the PR/MR URL if one was opened (relationship
+          'pull request', title like 'PR #42: <PR title>'); otherwise the pushed branch's URL
+          (relationship 'branch') or, for a direct commit to an existing branch, the commit's
+          URL (relationship 'commit'). Build the URL from `git remote get-url origin` and the
+          real branch name or commit SHA — never link something that wasn't pushed. Skip this
+          if nothing was pushed.
     5. Report back to the user what you found, what you changed (with file paths), and what
-       you updated on the ticket, including the commit/branch/push/PR outcome.
+       you updated on the ticket, including the commit/branch/push/PR outcome and the link
+       added to the ticket.
     """
 
-    return [base.UserMessage(prompt)]
+    return [base.UserMessage(prompt + _prompt_read_only_note())]
+
+
+def _apply_tool_filters() -> None:
+    """Remove tools per WAYPOINT_READ_ONLY / WAYPOINT_ENABLED_TOOLS / WAYPOINT_DISABLED_TOOLS.
+
+    Removed tools are neither listed nor callable. An unknown name in either list stops the
+    server rather than being ignored: a typo in a denylist would otherwise silently leave the
+    tool someone meant to switch off enabled."""
+    known = set(_TOOL_HINTS)
+    enabled, disabled = _env_names("WAYPOINT_ENABLED_TOOLS"), _env_names("WAYPOINT_DISABLED_TOOLS")
+    unknown = (enabled | disabled) - known
+    if unknown:
+        sys.exit(
+            f"Waypoint: unknown tool name(s) in WAYPOINT_ENABLED_TOOLS/WAYPOINT_DISABLED_TOOLS: "
+            f"{', '.join(sorted(unknown))}. Valid names: {', '.join(sorted(known))}"
+        )
+
+    remove = set(disabled)
+    if enabled:
+        remove |= known - enabled
+    if _READ_ONLY:
+        remove |= _JIRA_WRITE_TOOLS
+    for name in sorted(remove - _ALWAYS_AVAILABLE_TOOLS):
+        mcp.remove_tool(name)
+
+
+_apply_tool_filters()
 
 
 def main() -> None:

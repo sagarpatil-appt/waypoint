@@ -19,7 +19,8 @@
         "PYTHONPATH": "${__dirname}/lib",
         "JIRA_SITE_URL": "${user_config.site_url}",
         "JIRA_EMAIL": "${user_config.email}",
-        "JIRA_API_TOKEN": "${user_config.api_token}"
+        "JIRA_API_TOKEN": "${user_config.api_token}",
+        "WAYPOINT_READ_ONLY": "${user_config.read_only}"
       }
     }
   },
@@ -42,6 +43,13 @@
       "description": "Create one at https://id.atlassian.com/manage-profile/security/api-tokens",
       "required": true,
       "sensitive": true
+    },
+    "read_only": {
+      "type": "boolean",
+      "title": "Read-only mode",
+      "description": "Only read from Jira: hide every tool that changes tickets (comments, status, assignee, worklogs, new tickets, links, attachments, watchers).",
+      "required": false,
+      "default": false
     }
   }
 }
